@@ -1,53 +1,92 @@
+from langchain_experimental.agents.agent_toolkits.csv.base import create_csv_agent
+from langchain.agents.agent_types import AgentType
+import os
+import pandas as pd
 import streamlit as st
-from openai import OpenAI
+import fitz
+from langchain.agents import AgentType
+from langchain_community.chat_models import ChatOpenAI
+from langchain.chains import ConversationalRetrievalChain
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
+from tempfile import NamedTemporaryFile
+from dotenv import load_dotenv
 
-# Show title and description.
-st.title("📄 Document question answering")
-st.write(
-    "Upload a document below and ask a question about it – GPT will answer! "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-)
+load_dotenv()  
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+st.set_page_config(page_title="CSV & PDF QA", layout="wide")
+st.title("📄 CSV & PDF Question Answering App")
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+uploaded_file = st.file_uploader("Upload a CSV or PDF file", type=["csv", "pdf"])
+question = st.text_input("Ask a question about the uploaded file")
 
-    # Let the user upload a file via `st.file_uploader`.
-    uploaded_file = st.file_uploader(
-        "Upload a document (.txt or .md)", type=("txt", "md")
-    )
+if uploaded_file:
+    file_type = uploaded_file.name.split('.')[-1].lower()
+    if file_type == "csv":
+        st.success("CSV file detected")
+        with NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+            tmp.write(uploaded_file.getvalue())
+            tmp_path = tmp.name
 
-    # Ask the user for a question via `st.text_area`.
-    question = st.text_area(
-        "Now ask a question about the document!",
-        placeholder="Can you give me a short summary?",
-        disabled=not uploaded_file,
-    )
+        if "csv_agent" not in st.session_state:
+            with open(tmp_path, "r", encoding="utf-8") as f:
+                st.session_state.csv_agent = create_csv_agent(
+                    ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY),
+                    f,
+                    verbose=False,
+                    agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+                    allow_dangerous_code=True,
+                    handle_parsing_errors=True
+                )
 
-    if uploaded_file and question:
+        if question:
+            with st.spinner("Thinking..."):
+                try:
+                    response = st.session_state.csv_agent.run(question)
+                    st.write("### Answer:", response)
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
-        # Process the uploaded file and question.
-        document = uploaded_file.read().decode()
-        messages = [
-            {
-                "role": "user",
-                "content": f"Here's a document: {document} \n\n---\n\n {question}",
-            }
-        ]
+    elif file_type == "pdf":
+        st.success("PDF file detected")
+        with NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(uploaded_file.getvalue())
+            tmp_path = tmp.name
 
-        # Generate an answer using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            stream=True,
-        )
+        if "pdf_chain" not in st.session_state:
+            doc = fitz.open(tmp_path)
+            text = ""
+            for page in doc:
+                text += page.get_text()
 
-        # Stream the response to the app using `st.write_stream`.
-        st.write_stream(stream)
+            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            splits = splitter.split_text(text)
+
+            embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+            vectorstore = FAISS.from_texts(splits, embeddings)
+
+            llm = ChatOpenAI(model_name="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
+            st.session_state.pdf_chain = ConversationalRetrievalChain.from_llm(
+                llm,
+                vectorstore.as_retriever(),
+                return_source_documents=True
+            )
+            st.session_state.chat_history = []
+
+        if question:
+            with st.spinner("Searching PDF..."):
+                try:
+                    result = st.session_state.pdf_chain({
+                        "question": question,
+                        "chat_history": st.session_state.chat_history
+                    })
+                    st.session_state.chat_history.append((question, result["answer"]))
+                    st.write("### Answer:", result["answer"])
+                except Exception as e:
+                    st.error(f"Error: {e}")
+    else:
+        st.error("Please upload a valid CSV or PDF file.")
